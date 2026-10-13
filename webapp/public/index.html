@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>WAV Playlists</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="card">
+    <h1>WAV Playlists</h1>
+
+    <form id="playlist-form" novalidate>
+      <div class="field">
+        <label for="playlist-select">Playlist</label>
+        <select id="playlist-select">
+          <option value="">+ New playlist</option>
+        </select>
+        <p id="active-hint" class="hint active-hint"></p>
+      </div>
+
+      <div class="field">
+        <label for="playlist-name">Label</label>
+        <input id="playlist-name" type="text" maxlength="100" autocomplete="off"
+               placeholder="e.g. My Playlist">
+      </div>
+
+      <div class="field">
+        <div class="label-row">
+          <label for="playlist-urls">WAV URLs</label>
+          <span id="url-count" class="hint">0 URLs</span>
+        </div>
+        <textarea id="playlist-urls" rows="10" wrap="off" spellcheck="false"
+                  autocapitalize="off" autocomplete="off"
+                  placeholder="Paste one URL per line&#10;https://example.com/sound.wav"></textarea>
+      </div>
+
+      <div class="actions">
+        <button type="submit" id="save-btn" class="primary">Save playlist</button>
+        <button type="button" id="delete-btn" class="danger" disabled>Delete playlist</button>
+      </div>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+</body>
+</html>

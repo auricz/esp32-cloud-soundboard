@@ -1,0 +1,13 @@
+{
+  "name": "wav-playlists",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler d1 migrations apply wav-playlists --local && wrangler pages dev",
+    "db:migrate": "wrangler d1 migrations apply wav-playlists --remote",
+    "deploy": "wrangler pages deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
