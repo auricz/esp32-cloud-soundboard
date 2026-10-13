@@ -1,17 +1,22 @@
 const form = document.getElementById("playlist-form");
 const select = document.getElementById("playlist-select");
-const activeHint = document.getElementById("active-hint");
+const usedByHint = document.getElementById("used-by-hint");
 const nameInput = document.getElementById("playlist-name");
 const urlsInput = document.getElementById("playlist-urls");
 const urlCount = document.getElementById("url-count");
 const saveBtn = document.getElementById("save-btn");
 const deleteBtn = document.getElementById("delete-btn");
 const statusEl = document.getElementById("status");
+const buttonsStatus = document.getElementById("buttons-status");
+const buttonSelects = [...document.querySelectorAll("select[data-color]")];
+
+const BUTTON_LABELS = { red: "Red", blu: "Blue", yel: "Yellow", grn: "Green" };
+const listFormat = new Intl.ListFormat("en", { type: "conjunction" });
 
 // Summaries from GET /api/playlists: { id, name, count, updatedAt }.
 let playlists = [];
-// The playlist /api/random draws from (server-side selection), or null.
-let activeId = null;
+// From GET /api/buttons: { color, playlistId, name } for each button on the device.
+let buttons = [];
 
 async function api(path, options = {}) {
   const res = await fetch(`/api${path}`, {
@@ -26,9 +31,9 @@ async function api(path, options = {}) {
 
 const playlistPath = (id) => `/playlists/${encodeURIComponent(id)}`;
 
-function setStatus(message, kind = "") {
-  statusEl.textContent = message;
-  statusEl.className = `status ${kind}`;
+function setStatus(message, kind = "", el = statusEl) {
+  el.textContent = message;
+  el.className = `status ${kind}`;
 }
 
 function setBusy(busy) {
@@ -57,20 +62,31 @@ function updateUrlCount() {
   urlCount.classList.toggle("warning", nonWav > 0);
 }
 
-function renderActiveHint() {
-  const active = playlists.find((p) => p.id === activeId);
-  if (!active) {
-    activeHint.textContent = "No playlist is active, so /api/random has nothing to play.";
-    activeHint.classList.add("warning");
-    return;
+// Labels of the buttons that play from the given playlist, e.g. ["Red", "Green"]
+function buttonsUsing(id) {
+  return buttons.filter((b) => b.playlistId === id).map((b) => BUTTON_LABELS[b.color]);
+}
+
+function renderButtons() {
+  for (const buttonSelect of buttonSelects) {
+    const options = playlists.map((p) => new Option(`${p.name} (${p.count})`, p.id));
+    buttonSelect.replaceChildren(new Option("No playlist", ""), ...options);
+    const button = buttons.find((b) => b.color === buttonSelect.dataset.color);
+    buttonSelect.value = button?.playlistId ?? "";
   }
-  const link = document.createElement("a");
-  link.href = "/api/random?format=json";
-  link.target = "_blank";
-  link.textContent = "/api/random";
-  activeHint.replaceChildren(link, ` plays from "${active.name}"`);
-  activeHint.classList.toggle("warning", active.count === 0);
-  if (active.count === 0) activeHint.append(", which has no URLs");
+}
+
+function renderUsedBy() {
+  const id = select.value;
+  const labels = buttonsUsing(id);
+  if (!id) {
+    usedByHint.textContent = "";
+  } else if (labels.length === 0) {
+    usedByHint.textContent = "Not on any button.";
+  } else {
+    const noun = labels.length === 1 ? "button" : "buttons";
+    usedByHint.textContent = `Played by the ${listFormat.format(labels)} ${noun}.`;
+  }
 }
 
 function renderSelect(selectedId = "") {
@@ -78,7 +94,7 @@ function renderSelect(selectedId = "") {
   select.replaceChildren(new Option("+ New playlist", ""), ...options);
   select.value = selectedId;
   deleteBtn.disabled = !selectedId;
-  renderActiveHint();
+  renderUsedBy();
 }
 
 function fillForm(playlist) {
@@ -98,22 +114,14 @@ function upsertSummary(playlist) {
   playlists.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function setActive(id) {
-  const selection = await api("/selection", {
-    method: "PUT",
-    body: JSON.stringify({ playlistId: id }),
-  });
-  activeId = selection.playlistId;
-}
-
 async function loadPlaylists() {
   setBusy(true);
   try {
-    const [list, selection] = await Promise.all([api("/playlists"), api("/selection")]);
-    playlists = list;
-    activeId = selection.playlistId;
-    renderSelect(activeId ?? "");
-    if (activeId) fillForm(await api(playlistPath(activeId)));
+    [playlists, buttons] = await Promise.all([api("/playlists"), api("/buttons")]);
+    renderButtons();
+    const firstId = playlists[0]?.id ?? "";
+    renderSelect(firstId);
+    if (firstId) fillForm(await api(playlistPath(firstId)));
     setStatus("");
   } catch (err) {
     setStatus(`Could not load playlists: ${err.message}`, "error");
@@ -122,26 +130,46 @@ async function loadPlaylists() {
   }
 }
 
-// Picking an existing playlist makes it the one /api/random draws from.
-// "+ New playlist" leaves the active playlist alone until the new one is saved.
+for (const buttonSelect of buttonSelects) {
+  buttonSelect.addEventListener("change", async () => {
+    const { color } = buttonSelect.dataset;
+    const label = BUTTON_LABELS[color];
+    const previous = buttons.find((b) => b.color === color)?.playlistId ?? "";
+    buttonSelect.disabled = true;
+    try {
+      const button = await api(`/buttons/${color}`, {
+        method: "PUT",
+        body: JSON.stringify({ playlistId: buttonSelect.value || null }),
+      });
+      buttons = buttons.map((b) => (b.color === color ? button : b));
+      const message = button.name ? `${label} plays "${button.name}".` : `${label} has no playlist.`;
+      setStatus(message, "success", buttonsStatus);
+      renderUsedBy();
+    } catch (err) {
+      buttonSelect.value = previous;
+      setStatus(`Could not change ${label}: ${err.message}`, "error", buttonsStatus);
+    } finally {
+      buttonSelect.disabled = false;
+    }
+  });
+}
+
 select.addEventListener("change", async () => {
   const id = select.value;
+  setStatus("");
+  renderUsedBy();
   if (!id) {
     fillForm(null);
-    setStatus("");
     deleteBtn.disabled = true;
     nameInput.focus();
     return;
   }
   setBusy(true);
   try {
-    const [playlist] = await Promise.all([api(playlistPath(id)), setActive(id)]);
-    fillForm(playlist);
-    setStatus(`"${playlist.name}" is now active.`, "success");
+    fillForm(await api(playlistPath(id)));
   } catch (err) {
-    setStatus(`Could not switch playlist: ${err.message}`, "error");
+    setStatus(`Could not load playlist: ${err.message}`, "error");
   } finally {
-    renderActiveHint();
     setBusy(false);
   }
 });
@@ -165,18 +193,11 @@ form.addEventListener("submit", async (event) => {
       body: JSON.stringify({ name, urls: parseUrls() }),
     });
     upsertSummary(playlist);
+    buttons = buttons.map((b) => (b.playlistId === playlist.id ? { ...b, name: playlist.name } : b));
+    renderButtons();
     renderSelect(playlist.id);
     fillForm(playlist);
     setStatus(`Saved "${playlist.name}".`, "success");
-    if (!id) {
-      try {
-        await setActive(playlist.id);
-        renderActiveHint();
-        setStatus(`Saved "${playlist.name}" and made it active.`, "success");
-      } catch (err) {
-        setStatus(`Saved "${playlist.name}", but could not make it active: ${err.message}`, "error");
-      }
-    }
   } catch (err) {
     setStatus(`Save failed: ${err.message}`, "error");
   } finally {
@@ -187,14 +208,22 @@ form.addEventListener("submit", async (event) => {
 deleteBtn.addEventListener("click", async () => {
   const id = select.value;
   const playlist = playlists.find((p) => p.id === id);
-  if (!playlist || !confirm(`Delete playlist "${playlist.name}"?`)) return;
+  if (!playlist) return;
+  const labels = buttonsUsing(id);
+  let question = `Delete playlist "${playlist.name}"?`;
+  if (labels.length) {
+    question += ` The ${listFormat.format(labels)} ${labels.length === 1 ? "button" : "buttons"}`;
+    question += " will be left without a playlist.";
+  }
+  if (!confirm(question)) return;
 
   setBusy(true);
   try {
     await api(playlistPath(id), { method: "DELETE" });
     playlists = playlists.filter((p) => p.id !== id);
-    // The server clears the selection when the active playlist is deleted.
-    if (activeId === id) activeId = null;
+    // The server unmaps the playlist from any buttons that used it.
+    buttons = buttons.map((b) => (b.playlistId === id ? { ...b, playlistId: null, name: null } : b));
+    renderButtons();
     renderSelect();
     fillForm(null);
     setStatus(`Deleted "${playlist.name}".`, "success");

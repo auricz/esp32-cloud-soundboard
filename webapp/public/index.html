@@ -12,13 +12,37 @@
   <main class="card">
     <h1>WAV Playlists</h1>
 
+    <section aria-labelledby="buttons-heading">
+      <h2 id="buttons-heading">Buttons</h2>
+      <div class="button-rows">
+        <label class="button-label" for="button-red">
+          <span class="swatch" data-color="red"></span>Red
+        </label>
+        <select id="button-red" data-color="red"></select>
+        <label class="button-label" for="button-blu">
+          <span class="swatch" data-color="blu"></span>Blue
+        </label>
+        <select id="button-blu" data-color="blu"></select>
+        <label class="button-label" for="button-yel">
+          <span class="swatch" data-color="yel"></span>Yellow
+        </label>
+        <select id="button-yel" data-color="yel"></select>
+        <label class="button-label" for="button-grn">
+          <span class="swatch" data-color="grn"></span>Green
+        </label>
+        <select id="button-grn" data-color="grn"></select>
+      </div>
+      <p id="buttons-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <h2>Edit playlists</h2>
     <form id="playlist-form" novalidate>
       <div class="field">
         <label for="playlist-select">Playlist</label>
         <select id="playlist-select">
           <option value="">+ New playlist</option>
         </select>
-        <p id="active-hint" class="hint active-hint"></p>
+        <p id="used-by-hint" class="hint used-by-hint"></p>
       </div>
 
       <div class="field">

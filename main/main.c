@@ -17,15 +17,19 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
-#define BTN_PIN 13
-#define LED_PIN 2
+#define BTN_RED_PIN 10
+#define BTN_BLU_PIN 11
+#define BTN_YEL_PIN 12
+#define BTN_GRN_PIN 13
+
+#define LED_PIN 20
 
 #define I2S_BCK_PIN 17
 #define I2S_DIN_PIN 16
 #define I2S_WCK_PIN 15
 
 // Pot wiper; outer legs to 3.3V and GND
-#define POT_PIN 4
+#define POT_PIN 2
 #define POT_MAX 4095
 
 // Button pulls BTN_PIN to GND, external 10k pull-up (R2) to 3.3V: pressed reads 0
@@ -42,9 +46,6 @@
 
 #define HTTP_TIMEOUT_MS 10000
 #define HTTP_MAX_REDIRECTS 5
-// ?format=text has the webapp return the WAV's URL as the body instead of redirecting to it,
-// so the webapp and the WAV's host each keep a connection of their own between presses
-#define API_URL CONFIG_SOUND_API_URL "?format=text"
 // The webapp accepts URLs up to 2048 characters
 #define WAV_URL_MAX 2048
 
@@ -56,6 +57,22 @@
 #define WIFI_CONNECTED_BIT BIT0
 
 static const char *TAG = "audio_output";
+
+// Each button plays from the playlist the webapp has mapped to its color. A press sets the
+// bit for the button's index in play_task's notification value.
+typedef struct {
+  gpio_num_t pin;
+  const char *color;
+} button_t;
+
+static const button_t buttons[] = {
+  { BTN_RED_PIN, "red" },
+  { BTN_BLU_PIN, "blu" },
+  { BTN_YEL_PIN, "yel" },
+  { BTN_GRN_PIN, "grn" },
+};
+
+#define BUTTON_COUNT (sizeof(buttons) / sizeof(buttons[0]))
 
 typedef struct {
   uint32_t sample_rate;
@@ -224,9 +241,19 @@ static void http_finish(esp_http_client_handle_t client)
   }
 }
 
-// Asks the webapp for the URL of a random WAV from the selected playlist
-static bool get_random_url(char *url, size_t size)
+// Asks the webapp for the URL of a random WAV from the playlist mapped to a button's color.
+// format=text has it return the URL as the body instead of redirecting to it, so the webapp
+// and the WAV's host each keep a connection of their own between presses.
+static bool get_random_url(const char *color, char *url, size_t size)
 {
+  char api_url[sizeof(CONFIG_SOUND_API_URL) + 32];
+  snprintf(api_url, sizeof(api_url), "%s?format=text&color=%s", CONFIG_SOUND_API_URL, color);
+  // Only the query changes, so this keeps the connection
+  if (esp_http_client_set_url(api_client, api_url) != ESP_OK) {
+    ESP_LOGE(TAG, "Bad URL: %s", api_url);
+    return false;
+  }
+
   if (!http_get(api_client)) {
     return false;
   }
@@ -407,28 +434,42 @@ static int32_t read_volume(void)
   return ((int64_t)raw * raw * 32767) / ((int64_t)POT_MAX * POT_MAX);
 }
 
-// Downloads and plays one random sound from the webapp. Returns true if the button was pressed
-// again while it played, which cuts it short so the caller can play another.
-static bool play_random(void)
+// The first of the buttons whose bits are set in a notification value that's still held down,
+// or -1 if none are. Checked once the contacts have settled, so that bounce from releasing a
+// button doesn't count as a press.
+static int held_button(uint32_t bits)
+{
+  for (int i = 0; i < BUTTON_COUNT; i++) {
+    if ((bits & BIT(i)) && gpio_get_level(buttons[i].pin) == BTN_PRESSED_LEVEL) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Downloads and plays one random sound from the given button's playlist. Returns the button
+// pressed while it played, which cuts it short so the caller can play from that one, or -1.
+static int play_random(int button)
 {
   static const uint8_t silence[DMA_FRAME_NUM * sizeof(int16_t) * 2];
   static int16_t chunk[DMA_FRAME_NUM * 2];
   static fetch_ctx_t fetch_ctx;
   static char url[WAV_URL_MAX + 1];
+  const char *color = buttons[button].color;
   size_t written;
   wav_info_t wav;
   TickType_t start_tick = xTaskGetTickCount();
 
-  if (!get_random_url(url, sizeof(url)) || !open_wav(url)) {
-    return false;
+  if (!get_random_url(color, url, sizeof(url)) || !open_wav(url)) {
+    return -1;
   }
   if (!wav_read_header(wav_client, &wav)) {
     ESP_LOGE(TAG, "Not a 16-bit PCM mono/stereo WAV: %s", url);
     esp_http_client_close(wav_client);
-    return false;
+    return -1;
   }
 
-  ESP_LOGI(TAG, "Playing %s: %lu Hz, %u ch, %u bytes, connected in %lu ms", url,
+  ESP_LOGI(TAG, "Playing %s for %s: %lu Hz, %u ch, %u bytes, connected in %lu ms", url, color,
            (unsigned long)wav.sample_rate, wav.channels, (unsigned)wav.data_len,
            (unsigned long)pdTICKS_TO_MS(xTaskGetTickCount() - start_tick));
 
@@ -442,32 +483,34 @@ static bool play_random(void)
   };
   if (xTaskCreate(fetch_task, "fetch_task", 6144, &fetch_ctx, 5, NULL) != pdPASS) {
     esp_http_client_close(wav_client);
-    return false;
+    return -1;
   }
 
   // Presses while connecting were most likely impatience, not a request to skip this sound
-  ulTaskNotifyTake(pdTRUE, 0);
+  xTaskNotifyWait(0, UINT32_MAX, NULL, 0);
 
   bool fetch_finished = false;
   while (!fetch_finished && xStreamBufferBytesAvailable(audio_buf) < PREBUFFER_SIZE) {
     fetch_finished = xSemaphoreTake(fetch_done, pdMS_TO_TICKS(10));
   }
 
-  bool press_pending = false;
-  bool pressed_again = false;
+  // Buttons with edges since the last debounce check
+  uint32_t pending = 0;
+  int next_button = -1;
   TickType_t press_tick = 0;
   while (1) {
-    // A press while playing skips to another sound. Each edge restarts the debounce window,
-    // and the press only counts if the button is still held once it settles, so bounce from
-    // releasing the button doesn't trigger a skip.
-    if (ulTaskNotifyTake(pdTRUE, 0)) {
-      press_pending = true;
+    // A press while playing skips to another sound from that button's playlist. Each edge
+    // restarts the debounce window, and a press only counts if its button is still held once
+    // the contacts settle.
+    uint32_t bits;
+    if (xTaskNotifyWait(0, UINT32_MAX, &bits, 0) == pdTRUE) {
+      pending |= bits;
       press_tick = xTaskGetTickCount();
     }
-    if (press_pending && xTaskGetTickCount() - press_tick >= pdMS_TO_TICKS(BTN_DEBOUNCE_MS)) {
-      press_pending = false;
-      if (gpio_get_level(BTN_PIN) == BTN_PRESSED_LEVEL) {
-        pressed_again = true;
+    if (pending && xTaskGetTickCount() - press_tick >= pdMS_TO_TICKS(BTN_DEBOUNCE_MS)) {
+      next_button = held_button(pending);
+      pending = 0;
+      if (next_button >= 0) {
         break;
       }
     }
@@ -500,8 +543,8 @@ static bool play_random(void)
   }
 
   // A press in the last few ms hasn't been confirmed yet; hand it back to play_task
-  if (press_pending) {
-    xTaskNotifyGive(xTaskGetCurrentTaskHandle());
+  if (pending) {
+    xTaskNotify(xTaskGetCurrentTaskHandle(), pending, eSetBits);
   }
 
   // i2s_channel_write returns once data is queued in DMA, not played. Pushing a full
@@ -510,17 +553,19 @@ static bool play_random(void)
     ESP_ERROR_CHECK(i2s_channel_write(tx_chan, silence, sizeof(silence), &written, portMAX_DELAY));
   }
 
-  return pressed_again;
+  return next_button;
 }
 
 static void play_task(void *arg)
 {
   while (1) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    uint32_t bits;
+    xTaskNotifyWait(0, UINT32_MAX, &bits, portMAX_DELAY);
 
     // Debounce: ignore edges where the button isn't still held after the contacts settle
     vTaskDelay(pdMS_TO_TICKS(BTN_DEBOUNCE_MS));
-    if (gpio_get_level(BTN_PIN) != BTN_PRESSED_LEVEL) {
+    int button = held_button(bits);
+    if (button < 0) {
       continue;
     }
 
@@ -531,16 +576,18 @@ static void play_task(void *arg)
 
     // The LED stays on while the sound downloads too, to show the press was taken
     gpio_set_level(LED_PIN, 1);
-    while (play_random()) {
+    while (button >= 0) {
+      button = play_random(button);
     }
     gpio_set_level(LED_PIN, 0);
   }
 }
 
+// arg is the button's index in buttons[]
 static void btn_isr_handler(void *arg)
 {
   BaseType_t woken = pdFALSE;
-  vTaskNotifyGiveFromISR(play_task_handle, &woken);
+  xTaskNotifyFromISR(play_task_handle, BIT((uintptr_t)arg), eSetBits, &woken);
   portYIELD_FROM_ISR(woken);
 }
 
@@ -601,20 +648,22 @@ void app_main(void)
   configASSERT(audio_buf && fetch_done);
 
   wifi_init();
-  api_client = http_client_new(API_URL);
-  // Pointed at each WAV's URL as it's played
-  wav_client = http_client_new(API_URL);
+  // Both are pointed at the URL for each request as it's made
+  api_client = http_client_new(CONFIG_SOUND_API_URL);
+  wav_client = http_client_new(CONFIG_SOUND_API_URL);
   pot_init();
   i2s_init();
 
   // TLS handshakes run on this task's stack
   xTaskCreate(play_task, "play_task", 8192, NULL, 5, &play_task_handle);
 
-  gpio_reset_pin(BTN_PIN);
-  gpio_set_direction(BTN_PIN, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(BTN_PIN, GPIO_FLOATING);
-  gpio_set_intr_type(BTN_PIN, GPIO_INTR_NEGEDGE);
-
   gpio_install_isr_service(0);
-  gpio_isr_handler_add(BTN_PIN, btn_isr_handler, NULL);
+  for (uintptr_t i = 0; i < BUTTON_COUNT; i++) {
+    gpio_num_t pin = buttons[i].pin;
+    gpio_reset_pin(pin);
+    gpio_set_direction(pin, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+    gpio_set_intr_type(pin, GPIO_INTR_NEGEDGE);
+    gpio_isr_handler_add(pin, btn_isr_handler, (void *)i);
+  }
 }

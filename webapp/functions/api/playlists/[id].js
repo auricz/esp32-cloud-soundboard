@@ -22,7 +22,7 @@ export async function onRequestPut({ request, params, env }) {
   return json(playlist);
 }
 
-// DELETE /api/playlists/:id (clears the selection if this playlist was selected)
+// DELETE /api/playlists/:id (buttons mapped to this playlist are left without one)
 export async function onRequestDelete({ params, env }) {
   await env.DB.prepare("DELETE FROM playlists WHERE id = ?").bind(params.id).run();
   return new Response(null, { status: 204 });

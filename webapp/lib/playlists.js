@@ -1,6 +1,9 @@
 // Shared helpers for the /api Pages Functions. Playlists live in the D1
 // `playlists` table (schema in migrations/), with urls stored as a JSON array.
 
+// The buttons on the device, as passed in /api/random?color=
+export const BUTTON_COLORS = ["red", "blu", "yel", "grn"];
+
 const MAX_NAME_LENGTH = 100;
 const MAX_URLS = 500;
 const MAX_URL_LENGTH = 2048;
