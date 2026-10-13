@@ -42,6 +42,11 @@
 
 #define HTTP_TIMEOUT_MS 10000
 #define HTTP_MAX_REDIRECTS 5
+// ?format=text has the webapp return the WAV's URL as the body instead of redirecting to it,
+// so the webapp and the WAV's host each keep a connection of their own between presses
+#define API_URL CONFIG_SOUND_API_URL "?format=text"
+// The webapp accepts URLs up to 2048 characters
+#define WAV_URL_MAX 2048
 
 // Audio downloaded ahead of playback (~370 ms of 44.1 kHz mono), so a slow patch of Wi-Fi
 // doesn't cut out the sound. Playback waits for half of it to fill before starting.
@@ -75,8 +80,12 @@ static adc_oneshot_unit_handle_t adc_handle;
 static adc_channel_t pot_channel;
 static EventGroupHandle_t wifi_events;
 static StreamBufferHandle_t audio_buf;
-// Given by fetch_task when it has finished and released the HTTP client
+// Given by fetch_task when it has finished with wav_client
 static SemaphoreHandle_t fetch_done;
+// One long-lived client per server, so a press can reuse the connection from the last one
+// instead of making new connections and checking certificates again
+static esp_http_client_handle_t api_client;
+static esp_http_client_handle_t wav_client;
 
 static uint16_t read_u16(const uint8_t *p)
 {
@@ -162,46 +171,109 @@ static bool wav_read_header(esp_http_client_handle_t client, wav_info_t *out)
   }
 }
 
-// GETs the random endpoint and follows its redirect to the chosen WAV, returning a client
-// that's ready to read the WAV's body. esp_http_client only follows redirects by itself in
-// esp_http_client_perform, which hands the body to a callback instead of letting it be read
-// as a stream, so they're followed here.
-static esp_http_client_handle_t http_open_random(void)
+static esp_http_client_handle_t http_client_new(const char *url)
 {
   esp_http_client_config_t cfg = {
-    .url = CONFIG_SOUND_API_URL,
+    .url = url,
     .timeout_ms = HTTP_TIMEOUT_MS,
     .crt_bundle_attach = esp_crt_bundle_attach,
+    // Servers drop idle connections after a while. When the client reconnects, a saved session
+    // lets the server skip the certificate and key exchange, if it still accepts the session.
+    .save_client_session = true,
+    // TCP keep-alive probes notice an idle connection that died without the server closing it
+    // (across a Wi-Fi drop, say), so the next request fails fast instead of waiting out timeout_ms
+    .keep_alive_enable = true,
   };
   esp_http_client_handle_t client = esp_http_client_init(&cfg);
-  if (client == NULL) {
-    return NULL;
+  configASSERT(client);
+  return client;
+}
+
+// Sends a GET for the client's URL and reads the response headers. The server may have closed
+// a kept connection while it sat idle, which only shows up now, so a failure gets one more
+// try on a new connection.
+static bool http_get(esp_http_client_handle_t client)
+{
+  for (int attempt = 0; attempt < 2; attempt++) {
+    // Body bytes that arrive along with the headers are cached in the client, and neither
+    // closing the connection nor starting a new request throws away any that weren't read.
+    // Left there, they'd be handed out as the start of this response's body, or trip an
+    // assert in esp_http_client_fetch_headers if some of them had been read.
+    esp_http_client_clear_response_buffer(client);
+    if (esp_http_client_open(client, 0) == ESP_OK && esp_http_client_fetch_headers(client) >= 0) {
+      return true;
+    }
+    esp_http_client_close(client);
+  }
+  ESP_LOGE(TAG, "Request failed");
+  return false;
+}
+
+// Reads off whatever is left of the response body, so the connection can carry the next
+// request, unless the server said it's closing it. This doesn't use
+// esp_http_client_flush_response: it leaves the count of bytes it flushed recorded as cached
+// body data, and that many junk bytes then come out ahead of the next response's body.
+static void http_finish(esp_http_client_handle_t client)
+{
+  char scratch[128];
+  while (esp_http_client_read(client, scratch, sizeof(scratch)) > 0) {
+  }
+  if (!esp_http_client_is_complete_data_received(client) ||
+      !esp_http_client_is_persistent_connection(client)) {
+    esp_http_client_close(client);
+  }
+}
+
+// Asks the webapp for the URL of a random WAV from the selected playlist
+static bool get_random_url(char *url, size_t size)
+{
+  if (!http_get(api_client)) {
+    return false;
+  }
+  int status = esp_http_client_get_status_code(api_client);
+  int len = esp_http_client_read_response(api_client, url, size - 1);
+  http_finish(api_client);
+  url[len > 0 ? len : 0] = '\0';
+
+  // Errors come back as a JSON message, which is worth logging as-is
+  if (status != 200 || len <= 0) {
+    ESP_LOGE(TAG, "HTTP %d from the webapp: %s", status, url);
+    return false;
+  }
+  return true;
+}
+
+// GETs the WAV and reads the response headers, leaving wav_client ready to read the body.
+// esp_http_client only follows redirects by itself in esp_http_client_perform, which hands
+// the body to a callback instead of letting it be read as a stream, so they're followed here.
+static bool open_wav(const char *url)
+{
+  // Keeps the connection if the WAV is on the same host as the last one
+  if (esp_http_client_set_url(wav_client, url) != ESP_OK) {
+    ESP_LOGE(TAG, "Bad URL: %s", url);
+    return false;
   }
 
   for (int i = 0; i <= HTTP_MAX_REDIRECTS; i++) {
-    if (esp_http_client_open(client, 0) != ESP_OK || esp_http_client_fetch_headers(client) < 0) {
-      ESP_LOGE(TAG, "Request failed");
-      break;
+    if (!http_get(wav_client)) {
+      return false;
     }
-
-    int status = esp_http_client_get_status_code(client);
+    int status = esp_http_client_get_status_code(wav_client);
     if (status == 200) {
-      return client;
+      return true;
     }
+    http_finish(wav_client);
     // set_redirection fails if there's no Location header to follow
-    if (status / 100 != 3 || esp_http_client_set_redirection(client) != ESP_OK) {
-      ESP_LOGE(TAG, "HTTP %d", status);
-      break;
+    if (status / 100 != 3 || esp_http_client_set_redirection(wav_client) != ESP_OK) {
+      ESP_LOGE(TAG, "HTTP %d for %s", status, url);
+      return false;
     }
-    esp_http_client_flush_response(client, NULL);
   }
-
-  esp_http_client_cleanup(client);
-  return NULL;
+  return false;
 }
 
 // Copies the WAV's sample data from the response body into audio_buf until it's all there
-// or play_task asks it to stop, then releases the client and gives fetch_done.
+// or play_task asks it to stop, then gives fetch_done.
 static void fetch_task(void *arg)
 {
   fetch_ctx_t *ctx = arg;
@@ -234,7 +306,13 @@ static void fetch_task(void *arg)
     have -= whole;
   }
 
-  esp_http_client_cleanup(ctx->client);
+  // Abandoning the body partway leaves the rest of it in the way of the next response, so
+  // only a complete download keeps the connection
+  if (remaining == 0) {
+    http_finish(ctx->client);
+  } else {
+    esp_http_client_close(ctx->client);
+  }
   xSemaphoreGive(fetch_done);
   vTaskDelete(NULL);
 }
@@ -336,36 +414,34 @@ static bool play_random(void)
   static const uint8_t silence[DMA_FRAME_NUM * sizeof(int16_t) * 2];
   static int16_t chunk[DMA_FRAME_NUM * 2];
   static fetch_ctx_t fetch_ctx;
+  static char url[WAV_URL_MAX + 1];
   size_t written;
   wav_info_t wav;
+  TickType_t start_tick = xTaskGetTickCount();
 
-  esp_http_client_handle_t client = http_open_random();
-  if (client == NULL) {
+  if (!get_random_url(url, sizeof(url)) || !open_wav(url)) {
     return false;
   }
-  if (!wav_read_header(client, &wav)) {
-    ESP_LOGE(TAG, "Not a 16-bit PCM mono/stereo WAV");
-    esp_http_client_cleanup(client);
+  if (!wav_read_header(wav_client, &wav)) {
+    ESP_LOGE(TAG, "Not a 16-bit PCM mono/stereo WAV: %s", url);
+    esp_http_client_close(wav_client);
     return false;
   }
 
-  char url[256];
-  if (esp_http_client_get_url(client, url, sizeof(url)) != ESP_OK) {
-    strcpy(url, "?");
-  }
-  ESP_LOGI(TAG, "Playing %s: %lu Hz, %u ch, %u bytes", url, (unsigned long)wav.sample_rate,
-           wav.channels, (unsigned)wav.data_len);
+  ESP_LOGI(TAG, "Playing %s: %lu Hz, %u ch, %u bytes, connected in %lu ms", url,
+           (unsigned long)wav.sample_rate, wav.channels, (unsigned)wav.data_len,
+           (unsigned long)pdTICKS_TO_MS(xTaskGetTickCount() - start_tick));
 
   i2s_set_format(&wav);
 
   xStreamBufferReset(audio_buf);
   fetch_ctx = (fetch_ctx_t){
-    .client = client,
+    .client = wav_client,
     .data_len = wav.data_len,
     .frame_size = wav.channels * sizeof(int16_t),
   };
   if (xTaskCreate(fetch_task, "fetch_task", 6144, &fetch_ctx, 5, NULL) != pdPASS) {
-    esp_http_client_cleanup(client);
+    esp_http_client_close(wav_client);
     return false;
   }
 
@@ -525,6 +601,9 @@ void app_main(void)
   configASSERT(audio_buf && fetch_done);
 
   wifi_init();
+  api_client = http_client_new(API_URL);
+  // Pointed at each WAV's URL as it's played
+  wav_client = http_client_new(API_URL);
   pot_init();
   i2s_init();
 

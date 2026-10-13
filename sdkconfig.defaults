@@ -3,3 +3,5 @@ CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 # Cloudflare serves a GTS Root R4 cross-signed by GlobalSign Root CA, which the bundle no longer
 # has. This lets verification stop at GTS Root R4, which it does have.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+# Lets HTTP clients resume a TLS session instead of doing a full handshake when they reconnect
+CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y
