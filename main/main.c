@@ -90,6 +90,7 @@ typedef struct {
 } fetch_ctx_t;
 
 static TaskHandle_t play_task_handle;
+static TaskHandle_t flash_led_handle;
 static i2s_chan_handle_t tx_chan;
 static uint32_t i2s_sample_rate;
 static uint16_t i2s_channels;
@@ -103,6 +104,11 @@ static SemaphoreHandle_t fetch_done;
 // instead of making new connections and checking certificates again
 static esp_http_client_handle_t api_client;
 static esp_http_client_handle_t wav_client;
+
+static void flash_led(void *arg);
+static void start_flash(TickType_t ms);
+static void stop_flash(void);
+
 
 static uint16_t read_u16(const uint8_t *p)
 {
@@ -473,6 +479,8 @@ static int play_random(int button)
            (unsigned long)wav.sample_rate, wav.channels, (unsigned)wav.data_len,
            (unsigned long)pdTICKS_TO_MS(xTaskGetTickCount() - start_tick));
 
+  start_flash(200);
+
   i2s_set_format(&wav);
 
   xStreamBufferReset(audio_buf);
@@ -574,10 +582,12 @@ static void play_task(void *arg)
       continue;
     }
 
-    // The LED stays on while the sound downloads too, to show the press was taken
-    gpio_set_level(LED_PIN, 1);
+    // The LED stays on while downloading and flashes while playing,
+    // so start_flash() is called in play_random()
     while (button >= 0) {
+      gpio_set_level(LED_PIN, 1);
       button = play_random(button);
+      stop_flash();
     }
     gpio_set_level(LED_PIN, 0);
   }
@@ -637,6 +647,28 @@ static void wifi_init(void)
   ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
+static void flash_led(void *arg)
+{
+  TickType_t ms = (TickType_t)arg;
+  while (1) {
+    gpio_set_level(LED_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    gpio_set_level(LED_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+  }
+}
+
+static void start_flash(TickType_t ms)
+{
+  xTaskCreate(flash_led, "wifi_flash_led", 1024, (void *)ms, 10, &flash_led_handle);
+}
+
+static void stop_flash(void)
+{
+  vTaskDelete(flash_led_handle);
+  gpio_set_level(LED_PIN, 0);
+}
+
 void app_main(void)
 {
   gpio_reset_pin(LED_PIN);
@@ -647,12 +679,14 @@ void app_main(void)
   fetch_done = xSemaphoreCreateBinary();
   configASSERT(audio_buf && fetch_done);
 
+  // Flash LED during init 
+  start_flash(50);
   wifi_init();
-  // Both are pointed at the URL for each request as it's made
   api_client = http_client_new(CONFIG_SOUND_API_URL);
   wav_client = http_client_new(CONFIG_SOUND_API_URL);
   pot_init();
   i2s_init();
+  stop_flash();
 
   // TLS handshakes run on this task's stack
   xTaskCreate(play_task, "play_task", 8192, NULL, 5, &play_task_handle);
