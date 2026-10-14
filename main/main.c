@@ -24,9 +24,9 @@
 
 #define LED_PIN 20
 
-#define I2S_BCK_PIN 17
-#define I2S_DIN_PIN 16
-#define I2S_WCK_PIN 15
+#define I2S_BCK_PIN 18
+#define I2S_DIN_PIN 17
+#define I2S_WCK_PIN 16
 
 // Pot wiper; outer legs to 3.3V and GND
 #define POT_PIN 2
@@ -56,7 +56,7 @@
 
 #define WIFI_CONNECTED_BIT BIT0
 
-static const char *TAG = "audio_output";
+static const char *TAG = "cloud-soundboard";
 
 // Each button plays from the playlist the webapp has mapped to its color. A press sets the
 // bit for the button's index in play_task's notification value.
