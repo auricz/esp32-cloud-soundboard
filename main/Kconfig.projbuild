@@ -10,7 +10,7 @@ menu "Sound player"
 
     config SOUND_API_URL
         string "Random sound URL"
-        default "https://audio.auriczhou.com/api/random"
+        default ""
         help
             The webapp's /api/random endpoint. Each button press adds its color
             (red, blu, yel or grn) as ?color=, and gets back a WAV picked at random
