@@ -108,6 +108,7 @@ static esp_http_client_handle_t wav_client;
 static void flash_led(void *arg);
 static void start_flash(TickType_t ms);
 static void stop_flash(void);
+static int is_flashing = 0;
 
 
 static uint16_t read_u16(const uint8_t *p)
@@ -604,12 +605,15 @@ static void btn_isr_handler(void *arg)
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+    start_flash(100);
     esp_wifi_connect();
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    start_flash(100);
     xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT);
     ESP_LOGW(TAG, "Wi-Fi disconnected, retrying");
     esp_wifi_connect();
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    stop_flash();
     ESP_LOGI(TAG, "Wi-Fi connected");
     xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
   }
@@ -660,11 +664,15 @@ static void flash_led(void *arg)
 
 static void start_flash(TickType_t ms)
 {
-  xTaskCreate(flash_led, "wifi_flash_led", 1024, (void *)ms, 10, &flash_led_handle);
+  if (!is_flashing) {
+    is_flashing = 1;
+    xTaskCreate(flash_led, "wifi_flash_led", 1024, (void *)ms, 10, &flash_led_handle);
+  }
 }
 
 static void stop_flash(void)
 {
+  is_flashing = 0;
   vTaskDelete(flash_led_handle);
   gpio_set_level(LED_PIN, 0);
 }
@@ -679,14 +687,11 @@ void app_main(void)
   fetch_done = xSemaphoreCreateBinary();
   configASSERT(audio_buf && fetch_done);
 
-  // Flash LED during init 
-  start_flash(50);
   wifi_init();
   api_client = http_client_new(CONFIG_SOUND_API_URL);
   wav_client = http_client_new(CONFIG_SOUND_API_URL);
   pot_init();
   i2s_init();
-  stop_flash();
 
   // TLS handshakes run on this task's stack
   xTaskCreate(play_task, "play_task", 8192, NULL, 5, &play_task_handle);
