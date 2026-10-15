@@ -1,0 +1,19 @@
+menu "Sound player"
+
+    config SOUND_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+
+    config SOUND_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config SOUND_API_URL
+        string "Random sound URL"
+        default "https://audio.auriczhou.com/api/random"
+        help
+            The webapp's /api/random endpoint. Each button press adds its color
+            (red, blu, yel or grn) as ?color=, and gets back a WAV picked at random
+            from the playlist the webapp has mapped to that button.
+
+endmenu
